@@ -22,6 +22,8 @@ class TradeExecutor:
         dry_run: bool = False,
         point_value: float = 10.0,
         max_retries: int = 3,
+        slippage_pips: float = 0.0,
+        breakeven_trigger_atr: float = 0.0,
     ) -> None:
         """Initialize trade executor.
 
@@ -32,6 +34,8 @@ class TradeExecutor:
             dry_run: If True, log signals but don't execute orders.
             point_value: Value per point per lot (for position sizing).
             max_retries: Maximum retry attempts for failed orders.
+            slippage_pips: Simulated slippage in pips for dry-run entries.
+            breakeven_trigger_atr: ATR multiplier to trigger breakeven SL move.
         """
         self._client = mt5_client
         self._risk = risk_manager
@@ -39,6 +43,8 @@ class TradeExecutor:
         self._dry_run = dry_run
         self._point_value = point_value
         self._max_retries = max_retries
+        self._slippage_pips = slippage_pips
+        self._breakeven_trigger_atr = breakeven_trigger_atr
 
     def execute_signal(
         self,
@@ -48,6 +54,7 @@ class TradeExecutor:
         daily_trades_count: int,
         daily_pnl: float,
         initial_balance: float | None = None,
+        current_spread: float | None = None,
     ) -> dict[str, Any] | None:
         """Execute a trading signal after risk validation.
 
@@ -72,6 +79,7 @@ class TradeExecutor:
             daily_pnl=daily_pnl,
             current_time=now,
             initial_balance=initial_balance,
+            current_spread=current_spread,
         )
 
         if not allowed:
@@ -98,12 +106,20 @@ class TradeExecutor:
 
         # Dry-run mode
         if self._dry_run:
+            # Simulate slippage on entry
+            entry_price = signal.entry_price
+            if self._slippage_pips > 0:
+                if signal.direction.value == "BUY":
+                    entry_price += self._slippage_pips
+                else:
+                    entry_price -= self._slippage_pips
+                logger.info(f"[DRY-RUN] Slippage applied: {signal.entry_price:.2f} -> {entry_price:.2f}")
             logger.info("[DRY-RUN] Order would be placed but dry-run mode is active")
             trade_record = {
                 "strategy": signal.strategy_name,
                 "symbol": "XAUUSD",
                 "direction": signal.direction.value,
-                "entry_price": signal.entry_price,
+                "entry_price": entry_price,
                 "exit_price": None,
                 "sl": signal.sl,
                 "tp": signal.tp,
@@ -116,7 +132,7 @@ class TradeExecutor:
             self._db.insert_trade(trade_record)
             return {
                 "ticket": 0,
-                "price": signal.entry_price,
+                "price": entry_price,
                 "volume": lot_size,
                 "comment": "dry-run",
             }
@@ -216,6 +232,40 @@ class TradeExecutor:
             logger.error(f"SL verification error: {e}")
             return False
 
+    def check_breakeven(
+        self,
+        trade: dict[str, Any],
+        current_price: float,
+        atr: float,
+    ) -> float | None:
+        """Check if trade should move SL to breakeven.
+
+        Returns new SL price (entry + small buffer) if breakeven trigger is met,
+        or None if no change needed.
+        """
+        if self._breakeven_trigger_atr <= 0 or atr <= 0:
+            return None
+
+        entry = trade["entry_price"]
+        direction = trade["direction"]
+        current_sl = trade["sl"]
+        trigger_distance = atr * self._breakeven_trigger_atr
+        buffer = atr * 0.05  # small buffer above entry
+
+        if direction in ("BUY", "Direction.BUY"):
+            # Only move to breakeven if price has moved enough and SL is still below entry
+            if current_price >= entry + trigger_distance and current_sl < entry:
+                new_sl = entry + buffer
+                logger.info(f"Breakeven triggered: SL {current_sl:.2f} -> {new_sl:.2f}")
+                return round(new_sl, 5)
+        else:
+            if current_price <= entry - trigger_distance and current_sl > entry:
+                new_sl = entry - buffer
+                logger.info(f"Breakeven triggered: SL {current_sl:.2f} -> {new_sl:.2f}")
+                return round(new_sl, 5)
+
+        return None
+
     def manage_trailing_stops(
         self,
         positions: list[dict[str, Any]],
@@ -244,16 +294,28 @@ class TradeExecutor:
                     )
                     entry_price = pos["price_open"]
                     current_sl = pos.get("sl", 0.0)
+                    original_sl_distance = abs(entry_price - current_sl)
 
+                    # After >=1R profit, tighten trail to 50% of original distance
                     if pos["type"] == "BUY":
-                        new_sl = current_price - abs(entry_price - current_sl)
+                        profit_distance = current_price - entry_price
+                        if profit_distance >= original_sl_distance:
+                            trail_distance = original_sl_distance * 0.5
+                        else:
+                            trail_distance = original_sl_distance
+                        new_sl = current_price - trail_distance
                         if new_sl > current_sl:
                             logger.info(
                                 f"Trailing SL for #{ticket}: {current_sl:.2f} -> {new_sl:.2f}"
                             )
                             modified.append({**pos, "sl": new_sl})
                     elif pos["type"] == "SELL":
-                        new_sl = current_price + abs(current_sl - entry_price)
+                        profit_distance = entry_price - current_price
+                        if profit_distance >= original_sl_distance:
+                            trail_distance = original_sl_distance * 0.5
+                        else:
+                            trail_distance = original_sl_distance
+                        new_sl = current_price + trail_distance
                         if new_sl < current_sl:
                             logger.info(
                                 f"Trailing SL for #{ticket}: {current_sl:.2f} -> {new_sl:.2f}"

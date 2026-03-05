@@ -4,8 +4,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 
+import numpy as np
 import pandas as pd
 import pandas_ta as ta
 from loguru import logger
@@ -45,11 +46,12 @@ class Strategy(ABC):
         ...
 
     @abstractmethod
-    def analyze(self, df: pd.DataFrame) -> Signal | None:
+    def analyze(self, df: pd.DataFrame, **kwargs: Any) -> Signal | None:
         """Analyze price data and generate a trading signal.
 
         Args:
             df: OHLCV DataFrame with columns: datetime, open, high, low, close, volume.
+            **kwargs: Additional data (e.g. htf_data for HTF confirmation).
 
         Returns:
             Signal if conditions are met, None otherwise.
@@ -71,6 +73,8 @@ class EMACrossoverStrategy(Strategy):
         sl_atr_multiplier: float = 1.5,
         tp_sl_ratio: float = 2.0,
         trailing_atr_trigger: float = 1.0,
+        volume_filter_multiplier: float = 0.0,
+        require_htf_confirmation: bool = False,
     ) -> None:
         self._fast_ema = fast_ema
         self._slow_ema = slow_ema
@@ -81,12 +85,33 @@ class EMACrossoverStrategy(Strategy):
         self._sl_atr_multiplier = sl_atr_multiplier
         self._tp_sl_ratio = tp_sl_ratio
         self._trailing_atr_trigger = trailing_atr_trigger
+        self._volume_filter_multiplier = volume_filter_multiplier
+        self._require_htf_confirmation = require_htf_confirmation
 
     @property
     def name(self) -> str:
         return "ema_crossover"
 
-    def analyze(self, df: pd.DataFrame) -> Signal | None:
+    def _check_htf_trend(self, htf_data: dict[str, pd.DataFrame]) -> str | None:
+        """Check higher-timeframe trend direction.
+
+        Returns "bullish", "bearish", or None if no HTF data.
+        Uses EMA(21) slope on the first available HTF dataframe.
+        """
+        for _tf, htf_df in htf_data.items():
+            if htf_df is None or len(htf_df) < 25:
+                continue
+            htf_ema = ta.ema(htf_df["close"], length=21)
+            if htf_ema is None or len(htf_ema) < 2:
+                continue
+            last = htf_ema.iloc[-1]
+            prev = htf_ema.iloc[-2]
+            if pd.isna(last) or pd.isna(prev):
+                continue
+            return "bullish" if last > prev else "bearish"
+        return None
+
+    def analyze(self, df: pd.DataFrame, htf_data: dict[str, pd.DataFrame] | None = None) -> Signal | None:
         """Analyze for EMA crossover signals with RSI filter."""
         if len(df) < self._slow_ema + 2:
             logger.debug("Not enough data for EMA crossover analysis")
@@ -99,6 +124,18 @@ class EMACrossoverStrategy(Strategy):
         df["rsi"] = ta.rsi(df["close"], length=self._rsi_period)
         df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=self._atr_period)
 
+        # Volume filter: reject if current volume < SMA(20) * multiplier
+        if self._volume_filter_multiplier > 0 and "volume" in df.columns:
+            vol_sma = df["volume"].rolling(20).mean()
+            curr_vol = df["volume"].iloc[-1]
+            threshold = vol_sma.iloc[-1]
+            if not pd.isna(threshold) and not pd.isna(curr_vol):
+                if curr_vol < threshold * self._volume_filter_multiplier:
+                    logger.debug(
+                        f"Volume filter: {curr_vol:.0f} < {threshold * self._volume_filter_multiplier:.0f}"
+                    )
+                    return None
+
         fast_col = f"ema_{self._fast_ema}"
         slow_col = f"ema_{self._slow_ema}"
         curr = df.iloc[-1]
@@ -106,6 +143,11 @@ class EMACrossoverStrategy(Strategy):
         # Check for NaN values
         if any(pd.isna([curr[fast_col], curr[slow_col], curr["rsi"], curr["atr"]])):
             return None
+
+        # HTF trend confirmation
+        htf_trend: str | None = None
+        if self._require_htf_confirmation and htf_data:
+            htf_trend = self._check_htf_trend(htf_data)
 
         atr = curr["atr"]
         sl_distance = atr * self._sl_atr_multiplier
@@ -121,6 +163,9 @@ class EMACrossoverStrategy(Strategy):
 
             # Bullish crossover: fast crosses above slow
             if prev[fast_col] <= prev[slow_col] and bar[fast_col] > bar[slow_col]:
+                if htf_trend == "bearish":
+                    logger.debug("HTF trend bearish — rejecting BUY signal")
+                    continue
                 if curr["rsi"] < self._rsi_overbought:
                     entry = curr["close"]
                     return Signal(
@@ -137,6 +182,9 @@ class EMACrossoverStrategy(Strategy):
 
             # Bearish crossover: fast crosses below slow
             if prev[fast_col] >= prev[slow_col] and bar[fast_col] < bar[slow_col]:
+                if htf_trend == "bullish":
+                    logger.debug("HTF trend bullish — rejecting SELL signal")
+                    continue
                 if curr["rsi"] > self._rsi_oversold:
                     entry = curr["close"]
                     return Signal(
@@ -188,7 +236,7 @@ class AsianRangeBreakoutStrategy(Strategy):
     def name(self) -> str:
         return "asian_breakout"
 
-    def analyze(self, df: pd.DataFrame) -> Signal | None:
+    def analyze(self, df: pd.DataFrame, **kwargs: Any) -> Signal | None:
         if len(df) < self._atr_period + 2:
             logger.debug("Not enough data for Asian breakout analysis")
             return None
@@ -265,3 +313,271 @@ class AsianRangeBreakoutStrategy(Strategy):
             )
 
         return None
+
+
+class BOSStrategy(Strategy):
+    """Break of Structure strategy.
+
+    Detects when price breaks above the last swing high (bullish BOS) or
+    below the last swing low (bearish BOS).
+    """
+
+    def __init__(
+        self,
+        swing_lookback: int = 20,
+        swing_strength: int = 3,
+        atr_period: int = 14,
+        sl_buffer_atr: float = 0.1,
+        tp_sl_ratio: float = 2.0,
+    ) -> None:
+        self._swing_lookback = swing_lookback
+        self._swing_strength = swing_strength
+        self._atr_period = atr_period
+        self._sl_buffer_atr = sl_buffer_atr
+        self._tp_sl_ratio = tp_sl_ratio
+
+    @property
+    def name(self) -> str:
+        return "bos"
+
+    def _find_swing_points(
+        self, df: pd.DataFrame,
+    ) -> list[tuple[int, float, Literal["high", "low"]]]:
+        """Find swing highs and lows in the DataFrame.
+
+        A swing high is a bar whose high is greater than the high of
+        `swing_strength` bars on each side.  Swing low is the mirror.
+        """
+        highs = df["high"].values
+        lows = df["low"].values
+        n = len(df)
+        strength = self._swing_strength
+        points: list[tuple[int, float, Literal["high", "low"]]] = []
+
+        for i in range(strength, n - strength):
+            # Swing high
+            is_swing_high = True
+            for j in range(1, strength + 1):
+                if highs[i] <= highs[i - j] or highs[i] <= highs[i + j]:
+                    is_swing_high = False
+                    break
+            if is_swing_high:
+                points.append((i, float(highs[i]), "high"))
+
+            # Swing low
+            is_swing_low = True
+            for j in range(1, strength + 1):
+                if lows[i] >= lows[i - j] or lows[i] >= lows[i + j]:
+                    is_swing_low = False
+                    break
+            if is_swing_low:
+                points.append((i, float(lows[i]), "low"))
+
+        return points
+
+    def analyze(self, df: pd.DataFrame, **kwargs: Any) -> Signal | None:
+        min_bars = max(self._swing_lookback + self._swing_strength * 2, self._atr_period + 2)
+        if len(df) < min_bars:
+            logger.debug("Not enough data for BOS analysis")
+            return None
+
+        df = df.copy()
+        df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=self._atr_period)
+
+        curr = df.iloc[-1]
+        atr = curr["atr"]
+        if pd.isna(atr):
+            return None
+
+        # Only look at the last `swing_lookback` bars (excluding current)
+        lookback_df = df.iloc[-(self._swing_lookback + self._swing_strength + 1):-1]
+        points = self._find_swing_points(lookback_df)
+
+        if not points:
+            return None
+
+        # Find last swing high and last swing low
+        last_swing_high: tuple[int, float, str] | None = None
+        last_swing_low: tuple[int, float, str] | None = None
+        for p in reversed(points):
+            if p[2] == "high" and last_swing_high is None:
+                last_swing_high = p
+            if p[2] == "low" and last_swing_low is None:
+                last_swing_low = p
+            if last_swing_high and last_swing_low:
+                break
+
+        close = curr["close"]
+        entry = close
+        buffer = atr * self._sl_buffer_atr
+        ts = curr.get("datetime", datetime.now())
+
+        # BUY: close breaks above last swing high
+        if last_swing_high and close > last_swing_high[1]:
+            if last_swing_low:
+                sl = last_swing_low[1] - buffer
+            else:
+                sl = entry - atr
+            sl_distance = entry - sl
+            tp = entry + sl_distance * self._tp_sl_ratio
+            return Signal(
+                direction=Direction.BUY,
+                entry_price=entry,
+                sl=sl,
+                tp=tp,
+                strategy_name=self.name,
+                timestamp=ts,
+            )
+
+        # SELL: close breaks below last swing low
+        if last_swing_low and close < last_swing_low[1]:
+            if last_swing_high:
+                sl = last_swing_high[1] + buffer
+            else:
+                sl = entry + atr
+            sl_distance = sl - entry
+            tp = entry - sl_distance * self._tp_sl_ratio
+            return Signal(
+                direction=Direction.SELL,
+                entry_price=entry,
+                sl=sl,
+                tp=tp,
+                strategy_name=self.name,
+                timestamp=ts,
+            )
+
+        return None
+
+
+class CandlePatternStrategy(Strategy):
+    """Hammer / Shooting Star candlestick pattern strategy."""
+
+    def __init__(
+        self,
+        min_wick_body_ratio: float = 2.0,
+        max_opposite_wick_ratio: float = 0.3,
+        trend_lookback: int = 5,
+        atr_period: int = 14,
+        sl_buffer_atr: float = 0.2,
+        tp_sl_ratio: float = 2.0,
+        require_confirmation: bool = True,
+    ) -> None:
+        self._min_wick_body_ratio = min_wick_body_ratio
+        self._max_opposite_wick_ratio = max_opposite_wick_ratio
+        self._trend_lookback = trend_lookback
+        self._atr_period = atr_period
+        self._sl_buffer_atr = sl_buffer_atr
+        self._tp_sl_ratio = tp_sl_ratio
+        self._require_confirmation = require_confirmation
+
+    @property
+    def name(self) -> str:
+        return "candle_pattern"
+
+    def _detect_pattern(self, candle: pd.Series) -> str | None:
+        """Detect hammer or shooting star on a single candle.
+
+        Returns "hammer", "shooting_star", or None.
+        """
+        o, h, l, c = candle["open"], candle["high"], candle["low"], candle["close"]
+        body = abs(c - o)
+        candle_range = h - l
+
+        if candle_range == 0 or body == 0:
+            return None
+
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+
+        # Hammer: body at top, long lower wick
+        if (lower_wick >= body * self._min_wick_body_ratio
+                and upper_wick <= candle_range * self._max_opposite_wick_ratio):
+            return "hammer"
+
+        # Shooting star: body at bottom, long upper wick
+        if (upper_wick >= body * self._min_wick_body_ratio
+                and lower_wick <= candle_range * self._max_opposite_wick_ratio):
+            return "shooting_star"
+
+        return None
+
+    def _has_prior_trend(self, df: pd.DataFrame, direction: str) -> bool:
+        """Check for a prior trend over the lookback window.
+
+        For hammer (bullish reversal): need prior downtrend.
+        For shooting_star (bearish reversal): need prior uptrend.
+        """
+        if len(df) < self._trend_lookback + 1:
+            return False
+
+        start_close = df["close"].iloc[-(self._trend_lookback + 1)]
+        end_close = df["close"].iloc[-1]
+
+        if direction == "hammer":
+            return start_close > end_close  # downtrend
+        else:  # shooting_star
+            return start_close < end_close  # uptrend
+
+    def analyze(self, df: pd.DataFrame, **kwargs: Any) -> Signal | None:
+        min_bars = self._trend_lookback + self._atr_period + 3
+        if len(df) < min_bars:
+            logger.debug("Not enough data for candle pattern analysis")
+            return None
+
+        df = df.copy()
+        df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=self._atr_period)
+
+        curr = df.iloc[-1]
+        atr = curr["atr"]
+        if pd.isna(atr):
+            return None
+
+        # Check pattern on the previous candle
+        pattern_candle = df.iloc[-2]
+        pattern = self._detect_pattern(pattern_candle)
+        if pattern is None:
+            return None
+
+        # Check prior trend (up to the pattern candle, exclusive)
+        trend_df = df.iloc[:-1]
+        if not self._has_prior_trend(trend_df, pattern):
+            logger.debug(f"No prior trend for {pattern}")
+            return None
+
+        # Confirmation: current candle must confirm direction
+        if self._require_confirmation:
+            if pattern == "hammer" and curr["close"] <= curr["open"]:
+                logger.debug("Hammer not confirmed — current candle is bearish")
+                return None
+            if pattern == "shooting_star" and curr["close"] >= curr["open"]:
+                logger.debug("Shooting star not confirmed — current candle is bullish")
+                return None
+
+        entry = curr["close"]
+        buffer = atr * self._sl_buffer_atr
+        ts = curr.get("datetime", datetime.now())
+
+        if pattern == "hammer":
+            sl = pattern_candle["low"] - buffer
+            sl_distance = entry - sl
+            tp = entry + sl_distance * self._tp_sl_ratio
+            return Signal(
+                direction=Direction.BUY,
+                entry_price=entry,
+                sl=sl,
+                tp=tp,
+                strategy_name=self.name,
+                timestamp=ts,
+            )
+        else:  # shooting_star
+            sl = pattern_candle["high"] + buffer
+            sl_distance = sl - entry
+            tp = entry - sl_distance * self._tp_sl_ratio
+            return Signal(
+                direction=Direction.SELL,
+                entry_price=entry,
+                sl=sl,
+                tp=tp,
+                strategy_name=self.name,
+                timestamp=ts,
+            )

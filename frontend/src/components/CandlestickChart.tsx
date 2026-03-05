@@ -15,21 +15,21 @@ export default function CandlestickChart({ candles }: CandlestickChartProps) {
 
     const chart = createChart(containerRef.current, {
       layout: {
-        background: { type: ColorType.Solid, color: "#1f2937" },
-        textColor: "#9ca3af",
+        background: { type: ColorType.Solid, color: "#111827" },
+        textColor: "#64748b",
       },
       grid: {
-        vertLines: { color: "#374151" },
-        horzLines: { color: "#374151" },
+        vertLines: { color: "rgba(148,163,184,0.06)" },
+        horzLines: { color: "rgba(148,163,184,0.06)" },
       },
       crosshair: {
         mode: 0,
       },
       rightPriceScale: {
-        borderColor: "#4b5563",
+        borderColor: "rgba(148,163,184,0.1)",
       },
       timeScale: {
-        borderColor: "#4b5563",
+        borderColor: "rgba(148,163,184,0.1)",
         timeVisible: true,
         secondsVisible: false,
       },
@@ -38,16 +38,16 @@ export default function CandlestickChart({ candles }: CandlestickChartProps) {
     chartRef.current = chart;
 
     const candleSeries = chart.addCandlestickSeries({
-      upColor: "#10b981",
-      downColor: "#ef4444",
-      borderDownColor: "#ef4444",
-      borderUpColor: "#10b981",
-      wickDownColor: "#ef4444",
-      wickUpColor: "#10b981",
+      upColor: "#14b8a6",
+      downColor: "#f43f5e",
+      borderDownColor: "#f43f5e",
+      borderUpColor: "#14b8a6",
+      wickDownColor: "#f43f5e",
+      wickUpColor: "#14b8a6",
     });
 
     const volumeSeries = chart.addHistogramSeries({
-      color: "#6366f1",
+      color: "#3b82f6",
       priceFormat: { type: "volume" },
       priceScaleId: "",
     });
@@ -68,7 +68,7 @@ export default function CandlestickChart({ candles }: CandlestickChartProps) {
       const volumeData = candles.map((c) => ({
         time: (new Date(c.datetime).getTime() / 1000) as number,
         value: c.volume,
-        color: c.close >= c.open ? "rgba(16,185,129,0.3)" : "rgba(239,68,68,0.3)",
+        color: c.close >= c.open ? "rgba(20,184,166,0.2)" : "rgba(244,63,94,0.2)",
       }));
 
       candleSeries.setData(candleData as any);
@@ -91,8 +91,8 @@ export default function CandlestickChart({ candles }: CandlestickChartProps) {
   }, [candles]);
 
   return (
-    <div className="rounded-xl border border-gray-700 bg-gray-800 p-4">
-      <h3 className="mb-3 text-sm font-semibold tracking-wider text-gray-400 uppercase">
+    <div className="rounded-2xl p-4 card-glow" style={{ background: "var(--bg-card)", border: "1px solid var(--border-subtle)" }}>
+      <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>
         Price Chart
       </h3>
       <div ref={containerRef} className="h-[400px] w-full" />

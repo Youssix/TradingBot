@@ -49,6 +49,7 @@ class ConfidenceScorer:
         regime: RegimeState,
         strategy_win_rate: float = 0.5,
         rl_q_values: list[float] | None = None,
+        rl_info: dict | None = None,
     ) -> float:
         """Calculate confidence score for a proposed trade.
 
@@ -57,7 +58,8 @@ class ConfidenceScorer:
             features: Dict from FeatureEngine.extract()
             regime: Current RegimeState
             strategy_win_rate: Rolling win rate of the proposing strategy
-            rl_q_values: Optional [Q_HOLD, Q_BUY, Q_SELL] from RL agent
+            rl_q_values: Optional [Q_HOLD, Q_BUY, Q_SELL] from legacy DQN
+            rl_info: Optional info dict from continuous agent (has "q_value", "mean", etc.)
 
         Returns:
             Confidence score in [0, 1].
@@ -121,9 +123,15 @@ class ConfidenceScorer:
         else:
             htf_score = 1.0 - (htf1 + htf2) / 2  # inverted for sells
 
-        # 6. RL Q-value spread bonus
+        # 6. RL conviction bonus (continuous or legacy discrete)
         rl_bonus = 0.0
-        if rl_q_values and len(rl_q_values) == 3:
+        if rl_info:
+            # Continuous agent: use q_value or mean as conviction
+            q_val = rl_info.get("q_value", rl_info.get("mean", 0.0))
+            if q_val is not None:
+                rl_bonus = np.clip(abs(q_val), 0, 1)
+        elif rl_q_values and len(rl_q_values) == 3:
+            # Legacy DQN: Q-value spread
             action_idx = 1 if is_buy else 2
             q_chosen = rl_q_values[action_idx]
             q_others = [rl_q_values[i] for i in range(3) if i != action_idx]

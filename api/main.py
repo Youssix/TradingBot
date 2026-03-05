@@ -47,6 +47,16 @@ async def lifespan(app: FastAPI):
     app.state.db = db
     app.state.mt5_client = mt5_client
 
+    # Strategy mode defaults
+    app.state.strategy_mode = "independent"
+    app.state.enabled_strategies = ["ema_crossover", "asian_breakout", "bos", "candle_pattern"]
+
+    # Pipeline training state (persists across SSE disconnections)
+    app.state.pipeline_task = None
+    app.state.pipeline_cancelled = {"value": False}
+    app.state.pipeline_progress = None
+    app.state.pipeline_logs = []
+
     # Initialize learning system components
     app.state.learning_enabled = config.learning.enabled
     _init_learning_state(app, config)
@@ -75,7 +85,7 @@ async def lifespan(app: FastAPI):
     logger.info("Resources released")
 
 
-def _save_rl_checkpoint(app: FastAPI) -> None:
+def _save_rl_checkpoint(app: FastAPI, profile: str = "medium") -> None:
     """Save RL model checkpoint to DB."""
     agent = getattr(app.state, "rl_agent", None)
     env = getattr(app.state, "rl_env", None)
@@ -85,18 +95,27 @@ def _save_rl_checkpoint(app: FastAPI) -> None:
             blob = agent.save_checkpoint()
             if blob:
                 db.save_rl_model(
-                    "dqn", blob, agent.episode, agent.epsilon,
-                    agent.total_reward, env.win_rate if env else 0.0,
+                    model_name=profile,
+                    model_blob=blob,
+                    episode=agent.episode,
+                    epsilon=agent.epsilon,
+                    total_reward=agent.total_reward,
+                    win_rate=env.win_rate if env else 0.0,
+                    profile=profile,
+                    timeframe=getattr(app.state.config, "mt5", None) and app.state.config.mt5.timeframe or "",
                 )
-                logger.info(f"RL checkpoint saved (episode {agent.episode})")
+                logger.info(f"RL checkpoint saved (profile={profile}, episode={agent.episode})")
         except Exception as e:
             logger.error(f"Failed to save RL checkpoint: {e}")
 
 
 def _apply_claude_rules(
-    action: int, features: dict, regime: str, session: str, db,
-) -> tuple[int, str]:
+    action: float, features: dict, regime: str, session: str, db,
+) -> tuple[float, str]:
     """Check active Claude rules and override action if needed.
+
+    Args:
+        action: continuous action float in [-1, +1]
 
     Returns (possibly overridden action, reason or empty string).
     """
@@ -107,19 +126,15 @@ def _apply_claude_rules(
     except Exception:
         return action, ""
 
-    from core.learning.rl_environment import Action
-
     for rule_set in rules:
         for rule in rule_set.get("rules_json", []):
             cond = rule.get("condition", "")
             rule_action = rule.get("action", "").upper()
             reason = rule.get("reason", "")
 
-            # Simple condition evaluator for common patterns
             triggered = False
             try:
                 if "ADX" in cond:
-                    # e.g. "ADX < 20"
                     adx = features.get("adx", 25)
                     if "<" in cond:
                         threshold = float(cond.split("<")[-1].strip())
@@ -128,13 +143,11 @@ def _apply_claude_rules(
                         threshold = float(cond.split(">")[-1].strip())
                         triggered = adx > threshold
                 elif "confidence" in cond:
-                    # e.g. "confidence < 0.5"
                     conf = features.get("confidence", 0.5)
                     if "<" in cond:
                         threshold = float(cond.split("<")[-1].strip())
                         triggered = conf < threshold
                 elif "session" in cond:
-                    # e.g. "session == asian" or "session == asian AND regime == ranging"
                     parts = cond.lower().replace("and", "&&").split("&&")
                     all_match = True
                     for part in parts:
@@ -160,7 +173,7 @@ def _apply_claude_rules(
                 continue
 
             if triggered and rule_action == "HOLD":
-                return Action.HOLD, reason
+                return 0.0, reason  # 0.0 = hold in continuous space
 
     return action, ""
 
@@ -230,8 +243,8 @@ async def _learning_loop(app: FastAPI) -> None:
             rd.update(features)
             regime = rd.current.regime.value
 
-            # --- 4. RL agent decides ---
-            action, q_values = agent.select_action(state)
+            # --- 4. RL agent decides (continuous action) ---
+            action, info = agent.select_action(state)
 
             # --- 4b. Apply Claude rules as filters ---
             original_action = action
@@ -241,11 +254,17 @@ async def _learning_loop(app: FastAPI) -> None:
             if override_reason:
                 logger.debug(
                     f"Claude rule overrode RL action "
-                    f"{original_action}→{action}: {override_reason}"
+                    f"{original_action:.2f}→{action:.2f}: {override_reason}"
                 )
 
             # --- 5. Execute action in environment ---
-            reward, trade_result = env.step(action, features["close"], state)
+            bar_atr = float(features.get("atr", 0.0))
+            bar_high = float(rates.iloc[-1]["high"])
+            bar_low = float(rates.iloc[-1]["low"])
+            reward, trade_result = env.step(
+                action, features["close"], state,
+                atr=bar_atr, high=bar_high, low=bar_low,
+            )
 
             # --- 6. Store transition in replay buffer ---
             from core.learning.replay_buffer import Transition
@@ -264,8 +283,25 @@ async def _learning_loop(app: FastAPI) -> None:
             # --- 7. If a trade completed → save to DB + trigger review ---
             if trade_result:
                 agent.end_episode(trade_result.reward)
+
+                # Convert raw point P&L to dollar P&L using real position sizing
+                point_value = 10.0  # $10 per point per lot for gold
+                sl_distance = abs(trade_result.entry_price - trade_result.sl_price) if trade_result.sl_price > 0 else 0.0
+                account_info = mt5.get_account_info()
+                balance = account_info.get("balance", 10_000.0)
+                risk_pct = config.risk.risk_pct
+
+                if sl_distance > 0 and point_value > 0:
+                    risk_amount = balance * (risk_pct / 100.0)
+                    lot_size = round(max(risk_amount / (sl_distance * point_value), 0.01), 2)
+                else:
+                    lot_size = 0.01
+
+                dollar_pnl = round(trade_result.pnl * lot_size * point_value, 2)
+
+                mt5.realize_pnl(dollar_pnl)
                 if tracker:
-                    tracker.record_trade("rl_agent", trade_result.pnl)
+                    tracker.record_trade("rl_agent", dollar_pnl)
 
                 # Save RL trade to trades DB table (visible in dashboard)
                 if db:
@@ -275,25 +311,26 @@ async def _learning_loop(app: FastAPI) -> None:
                         trade_id = db.insert_trade({
                             "strategy": "rl_agent",
                             "symbol": config.mt5.symbol,
-                            "direction": trade_result.action.name,
+                            "direction": trade_result.action.upper(),
                             "entry_price": trade_result.entry_price,
                             "exit_price": trade_result.exit_price,
-                            "sl": 0.0,
-                            "tp": 0.0,
-                            "lot_size": 0.01,
-                            "pnl": trade_result.pnl,
+                            "sl": trade_result.sl_price,
+                            "tp": trade_result.tp_price,
+                            "lot_size": lot_size,
+                            "pnl": dollar_pnl,
                             "opened_at": now,
                             "closed_at": now,
                             "status": "closed",
                         })
                         # Save trade features for Claude analysis
+                        q_val = info.get("q_value", 0.0) if info else 0.0
                         db.insert_trade_features(
                             trade_id=trade_id,
                             features={"vector": features["vector"]},
                             regime=regime,
-                            confidence=max(q_values) - min(q_values) if q_values else 0.0,
+                            confidence=abs(q_val),
                             rl_action=action,
-                            rl_q_values=list(q_values),
+                            rl_q_values=[action],
                             claude_reasoning=override_reason,
                         )
                     except Exception as e:
@@ -301,8 +338,9 @@ async def _learning_loop(app: FastAPI) -> None:
 
                 rl_trade_count += 1
                 logger.info(
-                    f"RL trade #{rl_trade_count} closed: {trade_result.action.name} | "
-                    f"PnL={trade_result.pnl:.4f} | reward={trade_result.reward:.4f} | "
+                    f"RL trade #{rl_trade_count} closed: {trade_result.action} | "
+                    f"P&L=${dollar_pnl:.2f} ({lot_size} lots) | "
+                    f"reward={trade_result.reward:.4f} | "
                     f"held {trade_result.hold_bars} bars | regime={regime}"
                 )
 
@@ -423,12 +461,16 @@ def _init_learning_state(app: FastAPI, config: AppConfig) -> None:
         app.state.claude_strategy = None
         app.state.claude_reviewer = None
         app.state.confidence_scorer = None
+        app.state.active_model_id = None
+        app.state.active_model_name = None
+        app.state.active_model_profile = None
+        app.state.active_model_timeframe = None
         return
 
     try:
         from core.learning.feature_engine import FeatureEngine
         from core.learning.regime_detector import RegimeDetector
-        from core.learning.rl_agent import RLAgent
+        from core.learning.agent_factory import create_agent
         from core.learning.rl_environment import TradingEnvironment
         from core.learning.performance_tracker import PerformanceTracker
         from core.learning.confidence_scorer import ConfidenceScorer
@@ -440,22 +482,23 @@ def _init_learning_state(app: FastAPI, config: AppConfig) -> None:
 
         app.state.feature_engine = FeatureEngine(primary_tf=tf)
         app.state.regime_detector = RegimeDetector(primary_tf=tf)
-        app.state.rl_agent = RLAgent(
-            state_dim=config.rl.state_dim,
-            action_dim=config.rl.action_dim,
-            lr=config.rl.lr,
-            gamma=config.rl.gamma,
-            epsilon_start=config.rl.epsilon_start,
-            epsilon_end=config.rl.epsilon_end,
-            epsilon_decay=config.rl.epsilon_decay,
-            buffer_capacity=config.rl.buffer_capacity,
-            batch_size=config.rl.batch_size,
-            target_update_freq=config.rl.target_update_freq,
-        )
+        app.state.rl_agent = create_agent(config)
         app.state.rl_env = TradingEnvironment(
             reward_scale=config.rl.reward_scale,
             penalty_scale=config.rl.penalty_scale,
         )
+
+        # Wrap env with composite reward if enabled
+        if config.composite_reward.enabled:
+            from core.learning.composite_reward import CompositeRewardWrapper
+            app.state.rl_env = CompositeRewardWrapper(
+                env=app.state.rl_env,
+                drawdown_weight=config.composite_reward.drawdown_weight,
+                drawdown_threshold=config.composite_reward.drawdown_threshold,
+                sortino_weight=config.composite_reward.sortino_weight,
+                sortino_window=config.composite_reward.sortino_window,
+                consistency_weight=config.composite_reward.consistency_weight,
+            )
         app.state.performance_tracker = PerformanceTracker(
             window_size=config.ensemble.performance_window,
         )
@@ -483,10 +526,30 @@ def _init_learning_state(app: FastAPI, config: AppConfig) -> None:
             max_tokens=config.claude.max_tokens_review,
         )
 
-        # Try loading latest RL checkpoint from DB
-        checkpoint = app.state.db.load_latest_rl_model("dqn")
-        if checkpoint and checkpoint.get("model_blob"):
-            app.state.rl_agent.load_checkpoint(checkpoint["model_blob"])
+        # Try loading latest RL checkpoint from DB (try each profile, fall back to "dqn")
+        checkpoint = None
+        for profile_name in ("medium", "conservative", "aggressive", "max_profit", "dqn"):
+            checkpoint = app.state.db.load_latest_rl_model(profile_name)
+            if checkpoint and checkpoint.get("model_blob"):
+                try:
+                    app.state.rl_agent.load_checkpoint(checkpoint["model_blob"])
+                    app.state.active_model_id = checkpoint.get("id")
+                    app.state.active_model_name = checkpoint.get("model_name")
+                    app.state.active_model_profile = checkpoint.get("profile")
+                    app.state.active_model_timeframe = checkpoint.get("timeframe")
+                    logger.info(f"Loaded RL model: profile={profile_name}, id={checkpoint.get('id')}")
+                    break
+                except Exception as ckpt_err:
+                    logger.warning(
+                        f"Skipping incompatible checkpoint profile={profile_name}: {ckpt_err}"
+                    )
+                    continue
+        else:
+            app.state.active_model_id = None
+            app.state.active_model_name = None
+            app.state.active_model_profile = None
+            app.state.active_model_timeframe = None
+            logger.info("No compatible RL model found, starting fresh")
 
         logger.info("Learning system initialized for API")
     except Exception as e:
@@ -501,6 +564,10 @@ def _init_learning_state(app: FastAPI, config: AppConfig) -> None:
         app.state.claude_strategy = None
         app.state.claude_reviewer = None
         app.state.confidence_scorer = None
+        app.state.active_model_id = None
+        app.state.active_model_name = None
+        app.state.active_model_profile = None
+        app.state.active_model_timeframe = None
 
 
 app = FastAPI(

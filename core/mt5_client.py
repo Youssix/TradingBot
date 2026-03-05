@@ -88,6 +88,10 @@ class MT5Client(ABC):
         """Get account information (balance, equity, margin, etc.)."""
         ...
 
+    def realize_pnl(self, pnl: float) -> None:
+        """Add realized P&L to account balance. No-op for real MT5 (broker tracks it)."""
+        pass
+
 
 class RealMT5Client(MT5Client):
     """Real MetaTrader 5 client implementation."""
@@ -297,10 +301,15 @@ class MockMT5Client(MT5Client):
         # Derive live tick from the latest candle data so price actually moves
         rates = self.get_rates(symbol, "M1", 200)
         last_close = float(rates["close"].iloc[-1])
-        spread = 0.30  # typical gold spread
+        # Adaptive spread by session (Asian wider, London/NY tighter)
+        hour = datetime.now().hour
+        if 0 <= hour < 8:
+            spread = 0.50  # Asian session
+        else:
+            spread = 0.25  # London/NY session
         jitter = float(np.random.randn() * 0.15)
         bid = last_close + jitter
-        return {"bid": round(bid, 2), "ask": round(bid + spread, 2), "time": datetime.now()}
+        return {"bid": round(bid, 2), "ask": round(bid + spread, 2), "time": datetime.now(), "spread": spread}
 
     def send_order(
         self, symbol: str, order_type: str, volume: float, price: float,
@@ -334,6 +343,9 @@ class MockMT5Client(MT5Client):
             "margin": 0.0, "free_margin": self._balance + total_profit,
             "profit": total_profit, "leverage": 100,
         }
+
+    def realize_pnl(self, pnl: float) -> None:
+        self._balance += pnl
 
 
 class YFinanceClient(MT5Client):
@@ -435,11 +447,17 @@ class YFinanceClient(MT5Client):
         """Get latest real price from the most recent candle."""
         df = self._fetch_data("M1", 5)
         last_close = float(df["close"].iloc[-1])
-        spread = 0.30
+        # Adaptive spread by session
+        hour = datetime.now().hour
+        if 0 <= hour < 8:
+            spread = 0.50  # Asian session
+        else:
+            spread = 0.25  # London/NY session
         return {
             "bid": round(last_close, 2),
             "ask": round(last_close + spread, 2),
             "time": datetime.now(),
+            "spread": spread,
         }
 
     def send_order(
@@ -474,6 +492,9 @@ class YFinanceClient(MT5Client):
             "margin": 0.0, "free_margin": self._balance + total_profit,
             "profit": total_profit, "leverage": 100,
         }
+
+    def realize_pnl(self, pnl: float) -> None:
+        self._balance += pnl
 
 
 def create_mt5_client(config: Any) -> MT5Client:

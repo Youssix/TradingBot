@@ -6,20 +6,15 @@ interface TradesTableProps {
   openTrades: Trade[];
 }
 
-type SortKey = "opened_at" | "pnl" | "strategy" | "symbol" | "direction";
+type SortKey = "opened_at" | "pnl" | "strategy" | "direction";
 type SortDir = "asc" | "desc";
-
-function formatPrice(val: number | null): string {
-  if (val === null || val === undefined) return "--";
-  return val.toFixed(5);
-}
 
 function formatPnl(val: number | null): string {
   if (val === null || val === undefined) return "--";
   return val >= 0 ? `+$${val.toFixed(2)}` : `-$${Math.abs(val).toFixed(2)}`;
 }
 
-function formatDate(val: string | null): string {
+function formatTime(val: string | null): string {
   if (!val) return "--";
   const d = new Date(val);
   return d.toLocaleString("en-US", {
@@ -30,18 +25,29 @@ function formatDate(val: string | null): string {
   });
 }
 
-export default function TradesTable({
-  closedTrades,
-  openTrades,
-}: TradesTableProps) {
+export default function TradesTable({ closedTrades, openTrades }: TradesTableProps) {
   const [tab, setTab] = useState<"closed" | "open">("closed");
   const [sortKey, setSortKey] = useState<SortKey>("opened_at");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [strategyFilter, setStrategyFilter] = useState<string>("All");
 
   const trades = tab === "closed" ? closedTrades : openTrades;
 
+  const strategies = useMemo(() => {
+    const set = new Set<string>();
+    trades.forEach((t) => set.add(t.strategy));
+    return Array.from(set).sort();
+  }, [trades]);
+
+  const filtered = useMemo(() => {
+    return trades.filter((t) => {
+      if (strategyFilter !== "All" && t.strategy !== strategyFilter) return false;
+      return true;
+    });
+  }, [trades, strategyFilter]);
+
   const sorted = useMemo(() => {
-    return [...trades].sort((a, b) => {
+    return [...filtered].sort((a, b) => {
       let aVal: any = a[sortKey];
       let bVal: any = b[sortKey];
       if (sortKey === "opened_at") {
@@ -56,7 +62,7 @@ export default function TradesTable({
       if (aVal > bVal) return sortDir === "asc" ? 1 : -1;
       return 0;
     });
-  }, [trades, sortKey, sortDir]);
+  }, [filtered, sortKey, sortDir]);
 
   function handleSort(key: SortKey) {
     if (sortKey === key) {
@@ -67,147 +73,157 @@ export default function TradesTable({
     }
   }
 
-  function sortIcon(key: SortKey) {
+  function sortArrow(key: SortKey) {
     if (sortKey !== key) return "";
-    return sortDir === "asc" ? " \u25B2" : " \u25BC";
+    return sortDir === "asc" ? " \u2191" : " \u2193";
   }
 
+  // Summary stats for current filter
+  const totalPnl = filtered.reduce((s, t) => s + (t.pnl ?? 0), 0);
+  const winCount = filtered.filter((t) => (t.pnl ?? 0) > 0).length;
+
   return (
-    <div className="rounded-xl border border-gray-700 bg-gray-800 p-4">
-      <div className="mb-4 flex items-center gap-4">
-        <h3 className="text-sm font-semibold tracking-wider text-gray-400 uppercase">
-          Trades
-        </h3>
-        <div className="flex rounded-lg bg-gray-900 p-0.5">
-          <button
-            onClick={() => setTab("closed")}
-            className={`rounded-md px-4 py-1.5 text-xs font-medium transition ${
-              tab === "closed"
-                ? "bg-gray-700 text-white"
-                : "text-gray-400 hover:text-white"
-            }`}
+    <div className="rounded-2xl overflow-hidden" style={{ background: "var(--bg-card)", border: "1px solid var(--border-subtle)" }}>
+      {/* Header bar */}
+      <div className="flex items-center justify-between px-5 py-3" style={{ borderBottom: "1px solid var(--border-subtle)" }}>
+        <div className="flex items-center gap-4">
+          <h3 className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>Trades</h3>
+          <div className="flex rounded-md overflow-hidden" style={{ border: "1px solid var(--border-medium)" }}>
+            <button
+              onClick={() => setTab("closed")}
+              className="px-3 py-1 text-[11px] font-medium transition-colors"
+              style={{
+                background: tab === "closed" ? "var(--bg-elevated)" : "transparent",
+                color: tab === "closed" ? "var(--text-primary)" : "var(--text-muted)",
+              }}
+            >
+              Closed ({closedTrades.length})
+            </button>
+            <button
+              onClick={() => setTab("open")}
+              className="px-3 py-1 text-[11px] font-medium transition-colors"
+              style={{
+                background: tab === "open" ? "var(--bg-elevated)" : "transparent",
+                color: tab === "open" ? "var(--text-primary)" : "var(--text-muted)",
+              }}
+            >
+              Open ({openTrades.length})
+            </button>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-3">
+          {/* Summary */}
+          <span className="font-num text-[11px] font-semibold" style={{ color: totalPnl >= 0 ? "var(--accent-teal)" : "var(--accent-rose)" }}>
+            {totalPnl >= 0 ? "+" : ""}{totalPnl.toFixed(2)}
+          </span>
+          <span className="text-[10px]" style={{ color: "var(--text-muted)" }}>
+            {winCount}W / {filtered.length - winCount}L
+          </span>
+          <span className="h-3 w-px" style={{ background: "var(--border-medium)" }} />
+          <select
+            value={strategyFilter}
+            onChange={(e) => setStrategyFilter(e.target.value)}
+            className="rounded-md px-2 py-1 text-[11px] outline-none"
+            style={{ background: "var(--bg-elevated)", color: "var(--text-secondary)", border: "1px solid var(--border-medium)" }}
           >
-            Closed ({closedTrades.length})
-          </button>
-          <button
-            onClick={() => setTab("open")}
-            className={`rounded-md px-4 py-1.5 text-xs font-medium transition ${
-              tab === "open"
-                ? "bg-gray-700 text-white"
-                : "text-gray-400 hover:text-white"
-            }`}
-          >
-            Open ({openTrades.length})
-          </button>
+            <option value="All">All Strategies</option>
+            {strategies.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
         </div>
       </div>
 
+      {/* Table */}
       <div className="overflow-x-auto">
-        <table className="w-full text-left text-sm">
+        <table className="w-full">
           <thead>
-            <tr className="border-b border-gray-700 text-xs text-gray-500 uppercase">
+            <tr style={{ borderBottom: "1px solid var(--border-subtle)" }}>
+              {[
+                { key: "direction" as SortKey, label: "Side" },
+                { key: "strategy" as SortKey, label: "Strategy" },
+              ].map(({ key, label }) => (
+                <th
+                  key={key}
+                  onClick={() => handleSort(key)}
+                  className="cursor-pointer px-4 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider transition-colors hover:text-white"
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  {label}{sortArrow(key)}
+                </th>
+              ))}
+              <th className="px-4 py-2.5 text-left text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>Symbol</th>
+              <th className="px-4 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>Entry</th>
+              <th className="px-4 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-muted)" }}>Exit</th>
               <th
-                className="cursor-pointer px-3 py-2 hover:text-gray-300"
-                onClick={() => handleSort("direction")}
-              >
-                Dir{sortIcon("direction")}
-              </th>
-              <th
-                className="cursor-pointer px-3 py-2 hover:text-gray-300"
-                onClick={() => handleSort("strategy")}
-              >
-                Strategy{sortIcon("strategy")}
-              </th>
-              <th
-                className="cursor-pointer px-3 py-2 hover:text-gray-300"
-                onClick={() => handleSort("symbol")}
-              >
-                Symbol{sortIcon("symbol")}
-              </th>
-              <th className="px-3 py-2">Entry</th>
-              <th className="px-3 py-2">Exit</th>
-              <th className="px-3 py-2">SL</th>
-              <th className="px-3 py-2">TP</th>
-              <th className="px-3 py-2">Lots</th>
-              <th
-                className="cursor-pointer px-3 py-2 hover:text-gray-300"
                 onClick={() => handleSort("pnl")}
+                className="cursor-pointer px-4 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wider transition-colors hover:text-white"
+                style={{ color: "var(--text-muted)" }}
               >
-                P&L{sortIcon("pnl")}
+                P&L{sortArrow("pnl")}
               </th>
               <th
-                className="cursor-pointer px-3 py-2 hover:text-gray-300"
                 onClick={() => handleSort("opened_at")}
+                className="cursor-pointer px-4 py-2.5 text-right text-[10px] font-semibold uppercase tracking-wider transition-colors hover:text-white"
+                style={{ color: "var(--text-muted)" }}
               >
-                Time{sortIcon("opened_at")}
+                Time{sortArrow("opened_at")}
               </th>
             </tr>
           </thead>
           <tbody>
             {sorted.length === 0 ? (
               <tr>
-                <td colSpan={10} className="px-3 py-8 text-center text-gray-500">
+                <td colSpan={7} className="px-4 py-10 text-center text-sm" style={{ color: "var(--text-muted)" }}>
                   No trades to display
                 </td>
               </tr>
             ) : (
-              sorted.map((t) => (
-                <tr
-                  key={t.id}
-                  className="border-b border-gray-700/50 transition hover:bg-gray-700/30"
-                >
-                  <td className="px-3 py-2.5">
-                    <span
-                      className={`inline-flex items-center gap-1 text-xs font-semibold ${
-                        t.direction === "buy"
-                          ? "text-emerald-400"
-                          : "text-red-400"
-                      }`}
-                    >
-                      {t.direction === "buy" ? "\u25B2" : "\u25BC"}{" "}
-                      {t.direction.toUpperCase()}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2.5 text-gray-300">{t.strategy}</td>
-                  <td className="px-3 py-2.5 font-medium text-white">
-                    {t.symbol}
-                  </td>
-                  <td className="px-3 py-2.5 font-mono text-gray-300">
-                    {formatPrice(t.entry_price)}
-                  </td>
-                  <td className="px-3 py-2.5 font-mono text-gray-300">
-                    {formatPrice(t.exit_price)}
-                  </td>
-                  <td className="px-3 py-2.5 font-mono text-gray-500">
-                    {formatPrice(t.sl)}
-                  </td>
-                  <td className="px-3 py-2.5 font-mono text-gray-500">
-                    {formatPrice(t.tp)}
-                  </td>
-                  <td className="px-3 py-2.5 text-gray-300">
-                    {t.lot_size}
-                  </td>
-                  <td className="px-3 py-2.5">
-                    <span
-                      className={`font-semibold ${
-                        (t.pnl ?? 0) >= 0
-                          ? "text-emerald-400"
-                          : "text-red-400"
-                      }`}
-                    >
-                      {formatPnl(t.pnl)}
-                    </span>
-                  </td>
-                  <td className="px-3 py-2.5 text-gray-400">
-                    {formatDate(t.opened_at)}
-                    {t.closed_at && (
-                      <span className="ml-1 text-gray-600">
-                        - {formatDate(t.closed_at)}
+              sorted.map((t) => {
+                const pnl = t.pnl ?? 0;
+                const isWin = pnl > 0;
+                return (
+                  <tr
+                    key={t.id}
+                    className="transition-colors hover:bg-white/[0.02]"
+                    style={{ borderBottom: "1px solid var(--border-subtle)" }}
+                  >
+                    <td className="px-4 py-2.5">
+                      <span
+                        className="inline-flex items-center gap-1 font-num text-[11px] font-bold uppercase"
+                        style={{ color: t.direction === "buy" ? "var(--accent-teal)" : "var(--accent-rose)" }}
+                      >
+                        <span className="text-[9px]">{t.direction === "buy" ? "\u25B2" : "\u25BC"}</span>
+                        {t.direction}
                       </span>
-                    )}
-                  </td>
-                </tr>
-              ))
+                    </td>
+                    <td className="px-4 py-2.5 text-[11px]" style={{ color: "var(--text-secondary)" }}>
+                      {t.strategy}
+                    </td>
+                    <td className="px-4 py-2.5 text-[11px] font-medium" style={{ color: "var(--text-primary)" }}>
+                      {t.symbol}
+                    </td>
+                    <td className="px-4 py-2.5 text-right font-num text-[11px]" style={{ color: "var(--text-secondary)" }}>
+                      {t.entry_price.toFixed(2)}
+                    </td>
+                    <td className="px-4 py-2.5 text-right font-num text-[11px]" style={{ color: "var(--text-secondary)" }}>
+                      {t.exit_price?.toFixed(2) ?? "--"}
+                    </td>
+                    <td className="px-4 py-2.5 text-right">
+                      <span
+                        className="font-num text-[11px] font-bold"
+                        style={{ color: isWin ? "var(--accent-teal)" : pnl < 0 ? "var(--accent-rose)" : "var(--text-muted)" }}
+                      >
+                        {formatPnl(pnl)}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2.5 text-right text-[11px]" style={{ color: "var(--text-muted)" }}>
+                      {formatTime(t.opened_at)}
+                    </td>
+                  </tr>
+                );
+              })
             )}
           </tbody>
         </table>

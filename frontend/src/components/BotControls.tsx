@@ -1,69 +1,106 @@
+import { useState, useEffect } from "react";
 import type { BotStatus } from "../api";
+import { setStrategyMode } from "../api";
 
 interface BotControlsProps {
   status: BotStatus | null;
 }
 
-function modeBadgeColor(mode: string): string {
-  switch (mode.toLowerCase()) {
-    case "live":
-      return "bg-red-900/50 text-red-300 border-red-700";
-    case "dry-run":
-      return "bg-amber-900/50 text-amber-300 border-amber-700";
-    case "backtest":
-      return "bg-blue-900/50 text-blue-300 border-blue-700";
-    default:
-      return "bg-gray-700 text-gray-300 border-gray-600";
-  }
-}
+const ALL_STRATEGIES = ["ema_crossover", "asian_breakout", "bos", "candle_pattern"];
 
 export default function BotControls({ status }: BotControlsProps) {
+  const [strategyMode, setMode] = useState<"independent" | "ensemble">("independent");
+  const [enabledStrategies, setEnabledStrategies] = useState<string[]>(ALL_STRATEGIES);
+
+  useEffect(() => {
+    if (status) {
+      setMode((status.strategy_mode as "independent" | "ensemble") || "independent");
+      if (status.enabled_strategies?.length) {
+        setEnabledStrategies(status.enabled_strategies);
+      }
+    }
+  }, [status]);
+
   if (!status) {
     return (
-      <div className="flex items-center gap-3">
-        <span className="h-2.5 w-2.5 rounded-full bg-gray-600" />
-        <span className="text-sm text-gray-500">Connecting...</span>
+      <div className="flex items-center gap-2">
+        <span className="h-2 w-2 rounded-full" style={{ background: "var(--text-muted)" }} />
+        <span className="text-xs" style={{ color: "var(--text-muted)" }}>Connecting...</span>
       </div>
     );
   }
 
   const isRunning = status.mode === "dry-run" || status.mode === "live";
 
+  const handleModeChange = async (newMode: "independent" | "ensemble") => {
+    setMode(newMode);
+    await setStrategyMode({ mode: newMode, enabled_strategies: enabledStrategies });
+  };
+
+  const modeBg = status.mode === "live"
+    ? "rgba(244,63,94,0.15)"
+    : status.mode === "dry-run"
+      ? "rgba(245,158,11,0.15)"
+      : "rgba(59,130,246,0.15)";
+
+  const modeColor = status.mode === "live"
+    ? "var(--accent-rose)"
+    : status.mode === "dry-run"
+      ? "var(--accent-amber)"
+      : "var(--accent-blue)";
+
   return (
-    <div className="flex flex-wrap items-center gap-4">
-      <div className="flex items-center gap-2">
+    <div className="flex items-center gap-3">
+      {/* Status dot + label */}
+      <div className="flex items-center gap-1.5">
         <span
-          className={`h-2.5 w-2.5 rounded-full ${
-            isRunning ? "bg-emerald-400 shadow-[0_0_8px_rgba(16,185,129,0.6)]" : "bg-red-400"
-          }`}
+          className={`h-2 w-2 rounded-full ${isRunning ? "animate-pulse-dot" : ""}`}
+          style={{ background: isRunning ? "var(--accent-teal)" : "var(--accent-rose)" }}
         />
-        <span className="text-sm font-medium text-gray-300">
+        <span className="text-xs font-medium" style={{ color: "var(--text-secondary)" }}>
           {isRunning ? "Running" : "Stopped"}
         </span>
       </div>
 
+      {/* Mode badge */}
       <span
-        className={`rounded-full border px-3 py-0.5 text-xs font-semibold uppercase ${modeBadgeColor(
-          status.mode
-        )}`}
+        className="rounded-full px-2.5 py-0.5 text-[10px] font-bold uppercase tracking-wider"
+        style={{ color: modeColor, background: modeBg }}
       >
         {status.mode}
       </span>
 
-      <span className="text-sm font-medium text-white">{status.symbol}</span>
+      {/* Symbol */}
+      <span className="font-num text-xs font-semibold" style={{ color: "var(--text-primary)" }}>
+        {status.symbol}
+      </span>
 
-      {status.strategies.length > 0 && (
-        <div className="flex gap-1.5">
-          {status.strategies.map((s) => (
-            <span
-              key={s}
-              className="rounded-md bg-gray-700 px-2 py-0.5 text-xs text-gray-300"
-            >
-              {s}
-            </span>
-          ))}
-        </div>
-      )}
+      {/* Divider */}
+      <span className="h-4 w-px" style={{ background: "var(--border-medium)" }} />
+
+      {/* Strategy mode toggle */}
+      <div className="flex rounded-md overflow-hidden" style={{ border: "1px solid var(--border-medium)" }}>
+        <button
+          onClick={() => handleModeChange("independent")}
+          className="px-2.5 py-1 text-[10px] font-medium transition-colors"
+          style={{
+            background: strategyMode === "independent" ? "var(--bg-elevated)" : "transparent",
+            color: strategyMode === "independent" ? "var(--text-primary)" : "var(--text-muted)",
+          }}
+        >
+          Independent
+        </button>
+        <button
+          onClick={() => handleModeChange("ensemble")}
+          className="px-2.5 py-1 text-[10px] font-medium transition-colors"
+          style={{
+            background: strategyMode === "ensemble" ? "var(--bg-elevated)" : "transparent",
+            color: strategyMode === "ensemble" ? "var(--text-primary)" : "var(--text-muted)",
+          }}
+        >
+          Ensemble
+        </button>
+      </div>
     </div>
   );
 }

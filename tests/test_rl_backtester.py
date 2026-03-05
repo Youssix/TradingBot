@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from core.learning.base_agent import BaseAgent
 from core.learning.feature_engine import FeatureEngine
 from core.learning.regime_detector import RegimeDetector
 from core.learning.rl_agent import RLAgent, TORCH_AVAILABLE
@@ -47,12 +48,14 @@ class TestRLBacktestConfig:
         assert cfg.count == 2000
         assert cfg.epochs == 3
         assert cfg.train_every == 5
+        assert cfg.profile == "medium"
 
     def test_custom(self):
-        cfg = RLBacktestConfig(timeframe="M5", count=1000, epochs=5, train_every=10)
+        cfg = RLBacktestConfig(timeframe="M5", count=1000, epochs=5, train_every=10, profile="aggressive")
         assert cfg.timeframe == "M5"
         assert cfg.count == 1000
         assert cfg.epochs == 5
+        assert cfg.profile == "aggressive"
 
 
 class TestRLBacktester:
@@ -89,7 +92,6 @@ class TestRLBacktester:
         bt2 = RLBacktester(config=config2)
         r2 = bt2.run(data)
 
-        # 3 epochs should produce >= 1 epoch worth of trades
         assert r2.total_trades >= r1.total_trades
 
     def test_epsilon_decays(self):
@@ -99,7 +101,6 @@ class TestRLBacktester:
         backtester = RLBacktester(config=config)
         result = backtester.run(data)
 
-        # If there were any trades (episodes), epsilon should have decayed
         if result.episodes > 0:
             assert result.final_epsilon < 1.0
 
@@ -135,15 +136,16 @@ class TestRLBacktester:
         if result.trades:
             t = result.trades[0]
             assert isinstance(t, RLTradeRecord)
-            assert t.action in ("BUY", "SELL")
+            assert t.action in ("buy", "sell")  # continuous action strings
             assert t.entry_price > 0
             assert t.exit_price > 0
             assert t.hold_bars >= 0
+            assert t.exit_reason in ("sl", "tp", "trailing", "signal", "max_hold")
 
     def test_custom_components(self):
-        """Backtester should accept custom RL components."""
+        """Backtester should accept custom RL components (BaseAgent)."""
         data = _make_ohlcv(200)
-        agent = RLAgent(state_dim=23, action_dim=3, epsilon_decay=0.99)
+        agent = RLAgent(state_dim=23, epsilon_decay=0.99)
         env = TradingEnvironment(reward_scale=2.0)
         fe = FeatureEngine(primary_tf="H1")
         rd = RegimeDetector(primary_tf="H1")
@@ -165,6 +167,7 @@ class TestRLBacktester:
 
         agent = backtester.agent
         assert agent is not None
+        assert isinstance(agent, BaseAgent)
         stats = agent.get_stats()
         assert "episode" in stats
 
@@ -176,15 +179,31 @@ class TestRLBacktester:
         backtester = RLBacktester(config=config)
         result = backtester.run(data)
 
-        # At least some epochs should have non-zero avg_train_loss
         losses = [s["avg_train_loss"] for s in result.epoch_stats]
         if result.total_trades > 10:
             assert any(l > 0 for l in losses)
 
+    def test_trades_have_exit_reason(self):
+        """All trades should have a non-empty exit_reason."""
+        data = _make_ohlcv(300)
+        config = RLBacktestConfig(epochs=1, train_every=5)
+        backtester = RLBacktester(config=config)
+        result = backtester.run(data)
+
+        for t in result.trades:
+            assert t.exit_reason in ("sl", "tp", "trailing", "signal", "max_hold")
+
+    def test_result_includes_profile(self):
+        """Result should include the profile name."""
+        data = _make_ohlcv(200)
+        config = RLBacktestConfig(epochs=1, train_every=10, profile="conservative")
+        backtester = RLBacktester(config=config)
+        result = backtester.run(data)
+        assert result.profile == "conservative"
+
 
 class TestMaxDrawdown:
     def test_no_drawdown(self):
-        """Monotonically increasing equity has 0 drawdown."""
         curve = [
             {"trade_index": i, "cumulative_pnl": float(i)}
             for i in range(1, 6)
@@ -193,12 +212,11 @@ class TestMaxDrawdown:
         assert dd == 0.0
 
     def test_known_drawdown(self):
-        """Known drawdown should be computed correctly."""
         curve = [
             {"trade_index": 1, "cumulative_pnl": 10.0},
-            {"trade_index": 2, "cumulative_pnl": 5.0},   # dd = 5
+            {"trade_index": 2, "cumulative_pnl": 5.0},
             {"trade_index": 3, "cumulative_pnl": 15.0},
-            {"trade_index": 4, "cumulative_pnl": 8.0},   # dd = 7
+            {"trade_index": 4, "cumulative_pnl": 8.0},
         ]
         dd = RLBacktester._compute_max_drawdown(curve)
         assert dd == 7.0

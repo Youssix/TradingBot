@@ -6,7 +6,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from core.strategy import AsianRangeBreakoutStrategy, Direction, EMACrossoverStrategy, Signal
+from core.strategy import (
+    AsianRangeBreakoutStrategy,
+    BOSStrategy,
+    CandlePatternStrategy,
+    Direction,
+    EMACrossoverStrategy,
+    Signal,
+)
 
 
 def _make_ohlcv(prices: list[float], start: datetime | None = None) -> pd.DataFrame:
@@ -311,4 +318,256 @@ class TestAsianBreakoutFilters:
         strategy = AsianRangeBreakoutStrategy()
         df = _make_asian_breakout_data(breakout="above", breakout_hour=22)
         signal = strategy.analyze(df)
+        assert signal is None
+
+
+# ---------------------------------------------------------------------------
+# BOS Strategy Tests
+# ---------------------------------------------------------------------------
+
+
+def _make_bos_data(
+    direction: str = "bullish",
+    swing_high: float = 1970.0,
+    swing_low: float = 1940.0,
+    n_bars: int = 60,
+) -> pd.DataFrame:
+    """Build data with clear swing points then a breakout candle.
+
+    Creates a range-bound series with swing highs/lows, then ends with
+    a candle that breaks the structure.
+    """
+    start = datetime(2024, 1, 1)
+    rows: list[dict] = []
+    mid = (swing_high + swing_low) / 2.0
+
+    # Build range-bound data with swing points
+    for i in range(n_bars - 1):
+        dt = start + timedelta(minutes=5 * i)
+        # Oscillate around mid to create swing points
+        cycle = np.sin(2 * np.pi * i / 12) * (swing_high - swing_low) / 2.5
+        c = mid + cycle
+        rows.append({
+            "datetime": dt,
+            "open": c - 0.5,
+            "high": c + 2.0,
+            "low": c - 2.0,
+            "close": c,
+            "volume": 1000,
+        })
+
+    # Ensure we have definite swing high and low within the data
+    # Place a clear swing high about 15 bars before end
+    sh_idx = len(rows) - 15
+    rows[sh_idx]["high"] = swing_high
+    rows[sh_idx]["close"] = swing_high - 1.0
+    # Ensure neighbors are lower
+    for j in range(1, 5):
+        if sh_idx - j >= 0:
+            rows[sh_idx - j]["high"] = min(rows[sh_idx - j]["high"], swing_high - 3.0)
+        if sh_idx + j < len(rows):
+            rows[sh_idx + j]["high"] = min(rows[sh_idx + j]["high"], swing_high - 3.0)
+
+    # Place a clear swing low about 10 bars before end
+    sl_idx = len(rows) - 10
+    rows[sl_idx]["low"] = swing_low
+    rows[sl_idx]["close"] = swing_low + 1.0
+    for j in range(1, 5):
+        if sl_idx - j >= 0:
+            rows[sl_idx - j]["low"] = max(rows[sl_idx - j]["low"], swing_low + 3.0)
+        if sl_idx + j < len(rows):
+            rows[sl_idx + j]["low"] = max(rows[sl_idx + j]["low"], swing_low + 3.0)
+
+    # Breakout candle
+    dt = start + timedelta(minutes=5 * (n_bars - 1))
+    if direction == "bullish":
+        bp = swing_high + 5.0
+        rows.append({
+            "datetime": dt,
+            "open": swing_high,
+            "high": bp + 1.0,
+            "low": swing_high - 1.0,
+            "close": bp,
+            "volume": 2000,
+        })
+    else:
+        bp = swing_low - 5.0
+        rows.append({
+            "datetime": dt,
+            "open": swing_low,
+            "high": swing_low + 1.0,
+            "low": bp - 1.0,
+            "close": bp,
+            "volume": 2000,
+        })
+
+    return pd.DataFrame(rows)
+
+
+@pytest.fixture
+def bos_strategy() -> BOSStrategy:
+    return BOSStrategy()
+
+
+class TestBOSBuySignal:
+    def test_bos_buy_on_swing_high_break(self, bos_strategy: BOSStrategy) -> None:
+        df = _make_bos_data("bullish")
+        signal = bos_strategy.analyze(df)
+        assert signal is not None
+        assert signal.direction == Direction.BUY
+        assert signal.strategy_name == "bos"
+
+    def test_bos_sl_at_opposite_swing_buy(self, bos_strategy: BOSStrategy) -> None:
+        df = _make_bos_data("bullish", swing_low=1940.0)
+        signal = bos_strategy.analyze(df)
+        assert signal is not None
+        # SL should be near (at or below) the swing low
+        assert signal.sl < signal.entry_price
+        assert signal.sl <= 1940.0
+
+
+class TestBOSSellSignal:
+    def test_bos_sell_on_swing_low_break(self, bos_strategy: BOSStrategy) -> None:
+        df = _make_bos_data("bearish")
+        signal = bos_strategy.analyze(df)
+        assert signal is not None
+        assert signal.direction == Direction.SELL
+        assert signal.strategy_name == "bos"
+
+
+class TestBOSNoSignal:
+    def test_bos_no_signal_in_range(self, bos_strategy: BOSStrategy) -> None:
+        """Price stays between swing high and low → no signal."""
+        df = _make_bos_data("bullish", swing_high=1970.0, swing_low=1940.0)
+        # Override the last candle close to be in the middle of the range
+        df.loc[df.index[-1], "close"] = 1955.0
+        df.loc[df.index[-1], "high"] = 1956.0
+        signal = bos_strategy.analyze(df)
+        assert signal is None
+
+
+# ---------------------------------------------------------------------------
+# CandlePattern Strategy Tests
+# ---------------------------------------------------------------------------
+
+
+def _make_candle_pattern_data(
+    pattern: str = "hammer",
+    with_confirmation: bool = True,
+    with_trend: bool = True,
+    n_bars: int = 40,
+) -> pd.DataFrame:
+    """Build data ending with a candlestick pattern + optional confirmation.
+
+    Args:
+        pattern: "hammer" or "shooting_star"
+        with_confirmation: whether the current (last) candle confirms
+        with_trend: whether there's a prior trend
+    """
+    start = datetime(2024, 1, 1)
+    rows: list[dict] = []
+
+    # Build prior trend
+    if pattern == "hammer":
+        # Need prior downtrend for hammer
+        if with_trend:
+            prices = list(np.linspace(1980, 1950, n_bars - 2))
+        else:
+            prices = [1951.0] * (n_bars - 2)  # flat at pattern level, no trend
+    else:
+        # Need prior uptrend for shooting star
+        if with_trend:
+            prices = list(np.linspace(1920, 1960, n_bars - 2))
+        else:
+            prices = [1959.0] * (n_bars - 2)  # flat at pattern level
+
+    for i, p in enumerate(prices):
+        dt = start + timedelta(minutes=5 * i)
+        rows.append({
+            "datetime": dt,
+            "open": p - 0.3,
+            "high": p + 1.0,
+            "low": p - 1.0,
+            "close": p,
+            "volume": 1000,
+        })
+
+    # Pattern candle (second to last)
+    dt = start + timedelta(minutes=5 * (n_bars - 2))
+    if pattern == "hammer":
+        # Hammer: body at top, long lower wick
+        o, c = 1950.0, 1951.0  # small bullish body
+        h = 1951.5  # tiny upper wick
+        l = 1944.0  # long lower wick (body ~1, lower wick ~6 → ratio=6)
+    else:
+        # Shooting star: body at bottom, long upper wick
+        o, c = 1960.0, 1959.0  # small bearish body
+        l = 1958.5  # tiny lower wick
+        h = 1966.0  # long upper wick
+
+    rows.append({
+        "datetime": dt,
+        "open": o,
+        "high": h,
+        "low": l,
+        "close": c,
+        "volume": 1500,
+    })
+
+    # Confirmation candle (last)
+    dt = start + timedelta(minutes=5 * (n_bars - 1))
+    if pattern == "hammer":
+        if with_confirmation:
+            # Bullish confirmation
+            rows.append({"datetime": dt, "open": 1951.0, "high": 1955.0, "low": 1950.0, "close": 1954.0, "volume": 1200})
+        else:
+            # Bearish — no confirmation
+            rows.append({"datetime": dt, "open": 1951.0, "high": 1952.0, "low": 1948.0, "close": 1949.0, "volume": 1200})
+    else:
+        if with_confirmation:
+            # Bearish confirmation
+            rows.append({"datetime": dt, "open": 1959.0, "high": 1960.0, "low": 1955.0, "close": 1956.0, "volume": 1200})
+        else:
+            # Bullish — no confirmation
+            rows.append({"datetime": dt, "open": 1959.0, "high": 1963.0, "low": 1958.0, "close": 1962.0, "volume": 1200})
+
+    return pd.DataFrame(rows)
+
+
+@pytest.fixture
+def candle_strategy() -> CandlePatternStrategy:
+    return CandlePatternStrategy()
+
+
+class TestHammerBuy:
+    def test_hammer_buy_after_downtrend(self, candle_strategy: CandlePatternStrategy) -> None:
+        df = _make_candle_pattern_data("hammer", with_confirmation=True, with_trend=True)
+        signal = candle_strategy.analyze(df)
+        assert signal is not None
+        assert signal.direction == Direction.BUY
+        assert signal.strategy_name == "candle_pattern"
+        assert signal.sl < signal.entry_price
+        assert signal.tp > signal.entry_price
+
+
+class TestShootingStarSell:
+    def test_shooting_star_sell_after_uptrend(self, candle_strategy: CandlePatternStrategy) -> None:
+        df = _make_candle_pattern_data("shooting_star", with_confirmation=True, with_trend=True)
+        signal = candle_strategy.analyze(df)
+        assert signal is not None
+        assert signal.direction == Direction.SELL
+        assert signal.strategy_name == "candle_pattern"
+        assert signal.sl > signal.entry_price
+        assert signal.tp < signal.entry_price
+
+
+class TestCandlePatternNoSignal:
+    def test_no_signal_without_confirmation(self, candle_strategy: CandlePatternStrategy) -> None:
+        df = _make_candle_pattern_data("hammer", with_confirmation=False, with_trend=True)
+        signal = candle_strategy.analyze(df)
+        assert signal is None
+
+    def test_no_signal_without_trend(self, candle_strategy: CandlePatternStrategy) -> None:
+        df = _make_candle_pattern_data("hammer", with_confirmation=True, with_trend=False)
+        signal = candle_strategy.analyze(df)
         assert signal is None

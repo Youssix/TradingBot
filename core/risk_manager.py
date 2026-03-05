@@ -17,6 +17,7 @@ class RiskConfig:
     max_total_drawdown_pct: float = 10.0
     friday_cutoff_hour: int = 20
     news_hours: list[tuple[int, int]] | None = None
+    max_spread_pips: float = 0.0
 
 
 class RiskManager:
@@ -111,6 +112,7 @@ class RiskManager:
         daily_pnl: float,
         current_time: datetime,
         initial_balance: float | None = None,
+        current_spread: float | None = None,
     ) -> tuple[bool, str]:
         """Run all risk checks. Returns (allowed, reason)."""
         balance = account_info.get("balance", 0.0)
@@ -121,6 +123,13 @@ class RiskManager:
             return False, "Friday cutoff"
         if self.is_news_hour(current_time):
             return False, "News hour"
+        if (
+            self._config.max_spread_pips > 0
+            and current_spread is not None
+            and current_spread > self._config.max_spread_pips
+        ):
+            logger.info(f"Spread too wide: {current_spread:.2f} > {self._config.max_spread_pips:.2f}")
+            return False, f"Spread too wide ({current_spread:.2f})"
         if not self.check_max_open_trades(len(open_positions)):
             return False, f"Max open trades ({self._config.max_open_trades})"
         if not self.check_max_daily_trades(daily_trades_count):
